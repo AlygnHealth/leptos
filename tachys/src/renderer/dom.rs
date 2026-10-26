@@ -251,7 +251,11 @@ impl Dom {
     }
 
     pub fn set_property_or_value(el: &Element, key: &str, value: &JsValue) {
-        if key == "value" {
+        // Only a `<select>` needs its `value` to wait: the option it names
+        // may not be a child yet (#4217). Anything else takes it at once, so
+        // a write an effect makes in the meantime is not overwritten.
+        if key == "value" && el.is_instance_of::<web_sys::HtmlSelectElement>()
+        {
             queue(Box::new({
                 let el = el.clone();
                 let value = value.clone();
