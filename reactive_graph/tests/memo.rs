@@ -575,3 +575,49 @@ fn memo_updates_even_if_not_read_until_later() {
     println!("read memo 2");
     assert_eq!(second_memo.get(), false);
 }
+
+/// `track()` on a memo nothing has read yet must still subscribe to the
+/// memo's sources, so the effect re-runs when they change - as it does when
+/// the effect calls `track()` on a signal (AlygnApp's 2026-10-22 report).
+#[cfg(feature = "effects")]
+#[tokio::test]
+async fn effect_reruns_when_it_only_tracks_an_unread_memo() {
+    use imports::*;
+
+    _ = Executor::init_tokio();
+    let owner = Owner::new();
+    owner.set();
+
+    task::LocalSet::new()
+        .run_until(async {
+            let generation = RwSignal::new(0u32);
+            let key = Memo::new(move |_| generation.get());
+            let direct = Arc::new(RwLock::new(0));
+            let via_memo = Arc::new(RwLock::new(0));
+
+            Effect::new({
+                let direct = Arc::clone(&direct);
+                move |_| {
+                    generation.track();
+                    *direct.write().unwrap() += 1;
+                }
+            });
+            Effect::new({
+                let via_memo = Arc::clone(&via_memo);
+                move |_| {
+                    key.track();
+                    *via_memo.write().unwrap() += 1;
+                }
+            });
+            Executor::tick().await;
+
+            for _ in 0..3 {
+                generation.update(|count| *count += 1);
+                Executor::tick().await;
+            }
+
+            assert_eq!(*direct.read().unwrap(), 4);
+            assert_eq!(*via_memo.read().unwrap(), 4);
+        })
+        .await
+}

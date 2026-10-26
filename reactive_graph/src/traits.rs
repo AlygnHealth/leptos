@@ -51,7 +51,7 @@
 pub use crate::trait_options::*;
 use crate::{
     effect::Effect,
-    graph::{Observer, Source, Subscriber, ToAnySource},
+    graph::{Observer, ReactiveNode, Source, Subscriber, ToAnySource},
     owner::Owner,
     signal::{arc_signal, guards::UntrackedWriteGuard, ArcReadSignal},
 };
@@ -115,7 +115,13 @@ impl<T: Source + ToAnySource + DefinedAt> Track for T {
         }
 
         if let Some(subscriber) = Observer::get() {
-            subscriber.add_source(self.to_any_source());
+            let source = self.to_any_source();
+            // A memo subscribes to its own sources only when it computes, so
+            // one that is tracked but never read would never hear of a change.
+            // Bringing it up to date first, before this subscriber is added,
+            // is a no-op for a signal.
+            source.update_if_necessary();
+            subscriber.add_source(source);
             self.add_subscriber(subscriber);
         } else {
             #[cfg(all(debug_assertions, feature = "effects"))]
