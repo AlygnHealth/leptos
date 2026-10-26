@@ -63,24 +63,41 @@ where
             let _guard = hook
                 .as_ref()
                 .map(|h| throw_error::set_error_hook(Arc::clone(h)));
-            let value = self.invoke();
-            if let Some(mut state) = prev {
-                value.rebuild(&mut state);
-                state
-            } else {
-                value.build()
-            }
+            build_or_rebuild(self.invoke(), prev)
         })
         .into()
     }
 
     #[track_caller]
     fn rebuild(self, state: &mut Self::State) {
-        let new = self.build();
-        let mut old = std::mem::replace(state, new);
-        old.insert_before_this(state);
-        old.unmount();
+        replace_effect_state(state, self.build());
     }
+}
+
+/// The body of a reactive function's render effect, kept out of line so it
+/// is compiled once per view type rather than once per closure: many
+/// closures in an app return the same type (`String`, `bool`, `AnyView`,
+/// an `Option` of one of those).
+#[inline(never)]
+fn build_or_rebuild<V: Render>(value: V, prev: Option<V::State>) -> V::State {
+    if let Some(mut state) = prev {
+        value.rebuild(&mut state);
+        state
+    } else {
+        value.build()
+    }
+}
+
+/// Swaps a reactive function's mounted state for a newly built one, once
+/// per state type rather than once per closure.
+#[inline(never)]
+fn replace_effect_state<S: Mountable + 'static>(
+    state: &mut RenderEffectState<S>,
+    new: RenderEffectState<S>,
+) {
+    let mut old = std::mem::replace(state, new);
+    old.insert_before_this(state);
+    old.unmount();
 }
 
 /// Retained view state for a [`RenderEffect`].
