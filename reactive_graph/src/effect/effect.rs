@@ -110,6 +110,30 @@ fn effect_base() -> (Receiver, Owner, Arc<RwLock<EffectInner>>) {
     (rx, owner, inner)
 }
 
+/// The loop behind [`Effect::new`], written once rather than once per effect
+/// function: wait for a notification, check the sources, and run the effect.
+fn spawn_effect_loop(
+    mut rx: Receiver,
+    owner: Owner,
+    subscriber: AnySubscriber,
+    mut run: Box<dyn FnMut()>,
+) {
+    let mut first_run = true;
+    Executor::spawn_local(async move {
+        while rx.next().await.is_some() {
+            if !owner.paused()
+                && (subscriber
+                    .with_observer(|| subscriber.update_if_necessary())
+                    || first_run)
+            {
+                first_run = false;
+                subscriber.clear_sources(&subscriber);
+                run();
+            }
+        }
+    });
+}
+
 #[cfg(debug_assertions)]
 thread_local! {
     static EFFECT_SCOPE_ACTIVE: AtomicBool = const { AtomicBool::new(false) };
@@ -170,36 +194,27 @@ impl Effect<LocalStorage> {
         T: 'static,
     {
         let inner = cfg!(feature = "effects").then(|| {
-            let (mut rx, owner, inner) = effect_base();
-            let value = Arc::new(RwLock::new(None::<T>));
-            let mut first_run = true;
+            let (rx, owner, inner) = effect_base();
+            let subscriber = inner.to_any_subscriber();
 
-            Executor::spawn_local({
-                let value = Arc::clone(&value);
-                let subscriber = inner.to_any_subscriber();
-
-                async move {
-                    while rx.next().await.is_some() {
-                        if !owner.paused()
-                            && (subscriber.with_observer(|| {
-                                subscriber.update_if_necessary()
-                            }) || first_run)
-                        {
-                            first_run = false;
-                            subscriber.clear_sources(&subscriber);
-
-                            let old_value =
-                                mem::take(&mut *value.write().or_poisoned());
-                            let new_value = owner.with_cleanup(|| {
-                                subscriber.with_observer(|| {
-                                    run_in_effect_scope(|| fun.run(old_value))
-                                })
-                            });
-                            *value.write().or_poisoned() = Some(new_value);
-                        }
-                    }
-                }
-            });
+            // codegen optimisation: only this one-run closure is generic over
+            // the effect's function; the loop that drives it is not.
+            let run: Box<dyn FnMut()> = {
+                let value = Arc::new(RwLock::new(None::<T>));
+                let owner = owner.clone();
+                let subscriber = subscriber.clone();
+                Box::new(move || {
+                    let old_value =
+                        mem::take(&mut *value.write().or_poisoned());
+                    let new_value = owner.with_cleanup(|| {
+                        subscriber.with_observer(|| {
+                            run_in_effect_scope(|| fun.run(old_value))
+                        })
+                    });
+                    *value.write().or_poisoned() = Some(new_value);
+                })
+            };
+            spawn_effect_loop(rx, owner, subscriber, run);
 
             ArenaItem::new_with_storage(Some(inner))
         });

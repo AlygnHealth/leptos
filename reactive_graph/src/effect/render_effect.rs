@@ -54,6 +54,27 @@ impl<T> Debug for RenderEffect<T> {
 #[cfg(feature = "subsecond")]
 type CurrentHotPtr = Box<dyn Fn() -> Option<subsecond::HotFnPtr> + Send + Sync>;
 
+/// The loop behind a local render effect, written once rather than once per
+/// value type: wait for a notification, check the sources, and run again.
+#[cfg(feature = "effects")]
+fn spawn_render_effect_loop(
+    mut rx: crate::channel::Receiver,
+    owner: Owner,
+    subscriber: AnySubscriber,
+    mut run: Box<dyn FnMut()>,
+) {
+    any_spawner::Executor::spawn_local(async move {
+        while rx.next().await.is_some() {
+            if !owner.paused()
+                && subscriber.with_observer(|| subscriber.update_if_necessary())
+            {
+                subscriber.clear_sources(&subscriber);
+                run();
+            }
+        }
+    });
+}
+
 impl<T> RenderEffect<T>
 where
     T: 'static,
@@ -156,7 +177,7 @@ where
             (owner, inner, rx)
         }
 
-        let (owner, inner, mut rx) = prep();
+        let (owner, inner, rx) = prep();
 
         let value = Arc::new(RwLock::new(None::<T>));
 
@@ -164,7 +185,7 @@ where
         {
             let _ = initial_value;
             let _ = owner;
-            let _ = &mut rx;
+            let _ = rx;
             let _ = fun;
         }
 
@@ -219,28 +240,22 @@ where
                 owner.with(|| subscriber.with_observer(|| fun(initial_value))),
             );
 
-            any_spawner::Executor::spawn_local({
+            // codegen optimisation: only this one-run closure is generic over
+            // `T`; the loop that drives it is not.
+            let run: Box<dyn FnMut()> = {
                 let value = Arc::clone(&value);
-
-                async move {
-                    while rx.next().await.is_some() {
-                        if !owner.paused()
-                            && subscriber.with_observer(|| {
-                                subscriber.update_if_necessary()
-                            })
-                        {
-                            subscriber.clear_sources(&subscriber);
-
-                            let old_value =
-                                mem::take(&mut *value.write().or_poisoned());
-                            let new_value = owner.with_cleanup(|| {
-                                subscriber.with_observer(|| fun(old_value))
-                            });
-                            *value.write().or_poisoned() = Some(new_value);
-                        }
-                    }
-                }
-            });
+                let owner = owner.clone();
+                let subscriber = subscriber.clone();
+                Box::new(move || {
+                    let old_value =
+                        mem::take(&mut *value.write().or_poisoned());
+                    let new_value = owner.with_cleanup(|| {
+                        subscriber.with_observer(|| fun(old_value))
+                    });
+                    *value.write().or_poisoned() = Some(new_value);
+                })
+            };
+            spawn_render_effect_loop(rx, owner, subscriber, run);
         }
 
         RenderEffect { value, inner }
